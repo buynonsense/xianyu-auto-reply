@@ -6,9 +6,9 @@ AI回复引擎模块
 import os
 import json
 import time
-import sqlite3
+import re
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from loguru import logger
 from openai import OpenAI
 from db_manager import db_manager
@@ -132,6 +132,13 @@ class AIReplyEngine:
             "debug": {}
         }
 
+        # 【新增】针对 GLM-4.5 系列尝试关闭思维链
+        model_name = settings.get('model_name', '').lower()
+        if 'glm-4.5' in model_name:
+            logger.info(f"检测到 GLM-4.5 模型 ({model_name})，尝试在 DashScope 请求中关闭思维链")
+            # DashScope 的参数结构可能略有不同，尝试放在 parameters 中
+            data["parameters"]["thinking"] = {"type": "disabled"}
+
         headers = {
             "Authorization": f"Bearer {settings['api_key']}",
             "Content-Type": "application/json"
@@ -156,15 +163,103 @@ class AIReplyEngine:
         else:
             raise Exception(f"DashScope API响应格式错误: {result}")
 
-    def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
-        """调用OpenAI兼容API"""
-        response = client.chat.completions.create(
-            model=settings['model_name'],
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature
-        )
-        return response.choices[0].message.content.strip()
+    def _clean_thinking_content(self, text: str) -> str:
+        """清理模型输出中的 <think>...</think> 标签内容"""
+        if not text:
+            return ""
+        # 使用正则移除 <think> 标签及其内容 (DOTALL模式让.匹配换行符)
+        cleaned_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        return cleaned_text.strip()
+
+    def _extract_response_content(self, response: Any) -> str:
+        """
+        智能提取响应内容，兼容普通模型和思考模型(Reasoning Models)
+        """
+        try:
+            message = response.choices[0].message
+            
+            # 1. 获取 content 字段 (标准字段)
+            content = getattr(message, 'content', '')
+            
+            # 2. 获取 reasoning_content 字段 (DeepSeek/OneAPI 等思考模型专用)
+            reasoning = getattr(message, 'reasoning_content', '')
+            
+            logger.info(f"🔍 [提取前状态] content长度={len(str(content))}, reasoning长度={len(str(reasoning))}")
+
+            final_reply = ""
+
+            if content:
+                # 如果 content 中包含 <think> 标签，说明是混合输出，需要清洗
+                if '<think>' in content:
+                    logger.info("检测到 <think> 标签，正在清洗思考过程...")
+                    final_reply = self._clean_thinking_content(content)
+                else:
+                    final_reply = content.strip()
+            
+            if not final_reply:
+                # 如果 content 为空，但有 reasoning
+                if reasoning:
+                    logger.warning("⚠️ 模型仅返回了思考过程(reasoning_content)，未返回最终回复(content)。这通常是因为Token不足导致生成被截断。")
+                    return ""
+                else:
+                    logger.warning("❌ 模型返回的 content 和 reasoning_content 均为空！可能被过滤或模型出错。")
+                    return ""
+
+            return final_reply
+
+        except Exception as e:
+            logger.error(f"解析响应内容失败: {e}")
+            logger.debug(f"原始响应对象: {response}")
+            return ""
+
+    def _call_openai_api(self, client: OpenAI, settings: dict, messages: list,
+                     max_tokens: int = 100, temperature: float = 0.7) -> str:
+        """
+        统一使用 chat.completions.create 调用 OpenAI 兼容接口
+        """
+        model = settings['model_name']
+        
+        try:
+            # 【新增】针对 GLM-4.5 系列尝试关闭思维链
+            extra_body = {}
+            if 'glm-4.5' in model.lower():
+                logger.info(f"检测到 GLM-4.5 模型 ({model})，尝试通过 extra_body 关闭思维链")
+                extra_body["thinking"] = {"type": "disabled"}
+
+            logger.info(f"🚀 [发起请求] 模型: {model}, MaxTokens: {max_tokens}, Temp: {temperature}")
+            
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_body=extra_body if extra_body else None  # 注入额外参数
+            )
+            
+            # ================== 暴力调试 ==================
+            try:
+                if hasattr(resp, 'model_dump_json'):
+                    raw_json = resp.model_dump_json(indent=2)
+                    logger.info(f"🔍 [原始AI响应 JSON]:\n{raw_json}")
+                else:
+                    logger.info(f"🔍 [原始AI响应 Raw]: {resp}")
+            except Exception as dump_err:
+                logger.error(f"无法序列化响应对象: {dump_err}")
+            # ============================================
+            
+            # 使用增强的提取逻辑
+            reply = self._extract_response_content(resp)
+            
+            if not reply:
+                logger.warning(f"⚠️ 模型 {model} 返回了空内容，请检查上方的 [原始AI响应]")
+            
+            return reply
+
+        except Exception as e:
+            logger.error(f"OpenAI API调用失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
         """检查指定账号是否启用AI回复"""
@@ -192,28 +287,33 @@ class AIReplyEngine:
             # 根据API类型选择调用方式
             if self._is_dashscope_api(settings):
                 logger.info(f"使用DashScope API进行意图检测")
-                response_text = self._call_dashscope_api(settings, messages, max_tokens=10, temperature=0.1)
+                # DashScope 暂时保持较小 Token，如果有问题也需要调大
+                response_text = self._call_dashscope_api(settings, messages, max_tokens=100, temperature=0.1)
             else:
                 logger.info(f"使用OpenAI兼容API进行意图检测")
                 client = self.get_client(cookie_id)
                 if not client:
                     return 'default'
-                logger.info(f"OpenAI客户端base_url: {client.base_url}")
-                response_text = self._call_openai_api(client, settings, messages, max_tokens=10, temperature=0.1)
+                
+                # 仍然保持较大的 token 以防参数注入失败，确保稳定性
+                response_text = self._call_openai_api(client, settings, messages, max_tokens=1000, temperature=0.1)
 
             intent = response_text.lower()
-            if intent in ['price', 'tech', 'default']:
-                return intent
+            # 简单清洗可能存在的标点
+            intent = intent.replace('.', '').replace('。', '').strip()
+            
+            if 'price' in intent or '价格' in intent:
+                return 'price'
+            elif 'tech' in intent or '技术' in intent:
+                return 'tech'
             else:
+                # 兜底逻辑：如果AI废话太多没返回标准关键词，但包含了相关字眼
+                if 'default' in intent or '其他' in intent:
+                    return 'default'
                 return 'default'
 
         except Exception as e:
             logger.error(f"意图检测失败 {cookie_id}: {e}")
-            # 打印更详细的错误信息
-            if hasattr(e, 'response') and hasattr(e.response, 'url'):
-                logger.error(f"请求URL: {e.response.url}")
-            if hasattr(e, 'request') and hasattr(e.request, 'url'):
-                logger.error(f"请求URL: {e.request.url}")
             return 'default'
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
@@ -288,15 +388,22 @@ class AIReplyEngine:
             ]
 
             # 根据API类型选择调用方式
+            reply = ""
             if self._is_dashscope_api(settings):
                 logger.info(f"使用DashScope API生成回复")
-                reply = self._call_dashscope_api(settings, messages, max_tokens=100, temperature=0.7)
+                reply = self._call_dashscope_api(settings, messages, max_tokens=2000, temperature=0.7)
             else:
                 logger.info(f"使用OpenAI兼容API生成回复")
                 client = self.get_client(cookie_id)
                 if not client:
                     return None
-                reply = self._call_openai_api(client, settings, messages, max_tokens=100, temperature=0.7)
+                # 【重要修复】生成回复时 Token 也要给足，改为 2000
+                reply = self._call_openai_api(client, settings, messages, max_tokens=2000, temperature=0.7)
+
+            # 检查回复是否为空
+            if not reply:
+                logger.warning(f"AI回复生成为空 (账号: {cookie_id})")
+                return None
 
             # 11. 保存对话记录
             self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
@@ -311,11 +418,6 @@ class AIReplyEngine:
             
         except Exception as e:
             logger.error(f"AI回复生成失败 {cookie_id}: {e}")
-            # 打印更详细的错误信息
-            if hasattr(e, 'response') and hasattr(e.response, 'url'):
-                logger.error(f"请求URL: {e.response.url}")
-            if hasattr(e, 'request') and hasattr(e.request, 'url'):
-                logger.error(f"请求URL: {e.request.url}")
             return None
     
     def get_conversation_context(self, chat_id: str, cookie_id: str, limit: int = 20) -> List[Dict]:

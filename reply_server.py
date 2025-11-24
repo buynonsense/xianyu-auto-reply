@@ -3672,7 +3672,7 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
 
 @app.post("/ai-reply-test/{cookie_id}")
 def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_auth)):
-    """测试AI回复功能"""
+    """测试AI回复功能 - 已适配前端 result.reply 读取逻辑"""
     try:
         # 检查账号是否存在
         if cookie_manager.manager is None:
@@ -3703,10 +3703,20 @@ def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_aut
             item_id="test_item"
         )
 
+        # 打印最终返回给前端的数据，确保有内容
+        logger.info(f"发送给前端的回复内容: {reply}")
+
         if reply:
-            return {"message": "测试成功", "reply": reply}
+            # 【精准匹配】前端直接读取 result.reply，所以必须把 reply 放在最外层
+            return {
+                "message": "测试成功", 
+                "reply": reply,  # <--- 这里对应前端的 result.reply
+                "code": 200      # 顺便带上状态码
+            }
         else:
-            raise HTTPException(status_code=400, detail="AI回复生成失败")
+            # 如果 reply 是空字符串，抛出异常让前端走进 else 逻辑显示错误
+            logger.warning(f"AI回复生成结果为空 (账号: {cookie_id})")
+            raise HTTPException(status_code=400, detail="AI回复生成为空，请检查日志")
 
     except HTTPException:
         raise
